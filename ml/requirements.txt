@@ -1,0 +1,8 @@
+numpy
+scipy
+librosa
+soundfile
+scikit-learn
+tensorflow
+coremltools
+tqdm

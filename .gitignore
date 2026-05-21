@@ -1,0 +1,12 @@
+.venv/
+/data/
+/device_exports/
+/models/
+/dry_runs/
+*.mlmodelc/
+DerivedData/
+.DS_Store
+__pycache__/
+*.pyc
+*.xcuserstate
+xcuserdata/
