@@ -3,12 +3,19 @@ import Foundation
 final class TrainingDataRecorder: @unchecked Sendable {
     struct Segment {
         var probability: Float
+        var nonSnoreProbability: Float
+        var snoreProbability: Float
+        var probabilitySum: Float
         var isSnoring: Bool
         var db: Float
+        var dbRelative: Float
+        var noiseFloorDb: Float
         var zeroCrossingRate: Double
         var sourceSampleRate: Double
         var windowIndex: Int
         var secondsFromStart: Double
+        var snoreIndexUsed: Int
+        var candidateRuleVersion: String
         var normalizedSamples: [Float]
     }
 
@@ -50,7 +57,7 @@ final class TrainingDataRecorder: @unchecked Sendable {
                 try FileManager.default.createDirectory(at: audioDirectory, withIntermediateDirectories: true)
 
                 let manifest = directory.appendingPathComponent("manifest.csv")
-                let header = "session_start,window_index,seconds_from_start,probability,is_snore,db,zero_crossing_rate,source_sample_rate,audio_file\n"
+                let header = "session_start,window_index,seconds_from_start,probability,p_non_snore,p_snore,p_sum,is_snore,db,db_relative,noise_floor_db,zero_crossing_rate,source_sample_rate,snore_index_used,candidate_rule_version,audio_file\n"
                 try header.write(to: manifest, atomically: true, encoding: .utf8)
 
                 let info = """
@@ -58,7 +65,9 @@ final class TrainingDataRecorder: @unchecked Sendable {
                   "purpose": "zzzly local inference capture",
                   "format": "csv inference rows plus suspicious 1-second wav clips",
                   "policy": "save every 1-second inference row; save wav only when snore or near-threshold audio is detected",
-                  "audio_policy": "wav saved when is_snore=1 or probability>=0.75 and db>-65, capped at 900 clips per night",
+                  "audio_policy": "wav saved when is_snore=1 or p_snore>=0.35 and db_relative>=8, capped at 900 clips per night",
+                  "snore_index_used": 1,
+                  "candidate_rule_version": "p1-relative-db-v1",
                   "session_start": "\(Self.isoString(startedAt))"
                 }
                 """
@@ -98,10 +107,17 @@ final class TrainingDataRecorder: @unchecked Sendable {
                     "\(segment.windowIndex)",
                     String(format: "%.3f", segment.secondsFromStart),
                     String(format: "%.5f", segment.probability),
+                    String(format: "%.5f", segment.nonSnoreProbability),
+                    String(format: "%.5f", segment.snoreProbability),
+                    String(format: "%.5f", segment.probabilitySum),
                     segment.isSnoring ? "1" : "0",
                     String(format: "%.2f", segment.db),
+                    String(format: "%.2f", segment.dbRelative),
+                    String(format: "%.2f", segment.noiseFloorDb),
                     String(format: "%.5f", segment.zeroCrossingRate),
                     String(format: "%.1f", segment.sourceSampleRate),
+                    "\(segment.snoreIndexUsed)",
+                    segment.candidateRuleVersion,
                     audioFilename
                 ].joined(separator: ",") + "\n"
 
@@ -171,7 +187,7 @@ final class TrainingDataRecorder: @unchecked Sendable {
     }
 
     private func shouldSaveAudio(_ segment: Segment) -> Bool {
-        segment.isSnoring || (segment.probability >= 0.75 && segment.db > -65)
+        segment.isSnoring || (segment.snoreProbability >= 0.35 && segment.dbRelative >= 8 && segment.db > -72)
     }
 
     private static func sessionName(for date: Date) -> String {

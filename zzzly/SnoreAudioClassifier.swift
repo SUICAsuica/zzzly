@@ -3,6 +3,11 @@ import CoreML
 import Foundation
 
 final class SnoreAudioClassifier: @unchecked Sendable {
+    struct Prediction {
+        var nonSnoreProbability: Float
+        var snoreProbability: Float
+    }
+
     static let shared = SnoreAudioClassifier()
 
     private let sampleRate = 16_000
@@ -11,7 +16,7 @@ final class SnoreAudioClassifier: @unchecked Sendable {
     private let targetFrames = 96
     private let fftSize = 512
     private let hopLength = 160
-    private let threshold: Float = 0.75
+    private let threshold: Float = 0.60
     private let model: MLModel?
     private let fftSetup: FFTSetup?
 
@@ -46,6 +51,10 @@ final class SnoreAudioClassifier: @unchecked Sendable {
     }
 
     func predictSnoreProbability(samples: [Float], sourceSampleRate: Double) -> Float? {
+        predictProbabilities(samples: samples, sourceSampleRate: sourceSampleRate)?.snoreProbability
+    }
+
+    func predictProbabilities(samples: [Float], sourceSampleRate: Double) -> Prediction? {
         guard let model else { return nil }
 
         let resampled = resample(samples: samples, sourceRate: sourceSampleRate)
@@ -70,13 +79,17 @@ final class SnoreAudioClassifier: @unchecked Sendable {
         let raw0 = values[0].floatValue
         let raw1 = values[1].floatValue
         if raw0 >= 0, raw1 >= 0, raw0 <= 1, raw1 <= 1 {
-            return raw0
+            return Prediction(nonSnoreProbability: raw0, snoreProbability: raw1)
         }
 
         let maxRaw = max(raw0, raw1)
         let exp0 = Foundation.exp(Double(raw0 - maxRaw))
         let exp1 = Foundation.exp(Double(raw1 - maxRaw))
-        return Float(exp0 / (exp0 + exp1))
+        let sum = exp0 + exp1
+        return Prediction(
+            nonSnoreProbability: Float(exp0 / sum),
+            snoreProbability: Float(exp1 / sum)
+        )
     }
 
     func isSnoring(samples: [Float], sourceSampleRate: Double) -> Bool? {

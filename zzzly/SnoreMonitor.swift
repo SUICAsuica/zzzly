@@ -71,7 +71,10 @@ final class SnoreMonitor: @unchecked Sendable {
     private var lastSnoreSecondsFromStart: Double?
     private var peakDecibels: Float = -160
     private var timelineBuckets: [Int: TimelineBucket] = [:]
-    private let snoreDecibelGate: Float = -55
+    private let candidateRuleVersion = "p1-relative-db-v1"
+    private var dbFloorSamples: [Float] = []
+    private var noiseFloorDb: Float = -75
+    private var recentCandidateFlags: [Bool] = []
     private var pendingAudioSamples: [Float] = []
     private var pendingSampleRate: Double = 16_000
     private let resultKey = "latestSnoreResult"
@@ -168,9 +171,27 @@ final class SnoreMonitor: @unchecked Sendable {
         let averageSnoreProbability = usedMachineLearning ? mlProbabilitySum / Double(max(mlWindowCount, 1)) : nil
         let verdict: SnoreVerdict
 
-        if ratio >= 0.16 || (!usedMachineLearning && (loudRatio >= 0.28 || peakDecibels > -14)) {
+        let snoreSeconds = Double(snoreWindowCount)
+        let activeSnoreMinutes = timelineBuckets.values.filter { $0.snoreCount >= 5 }.count
+        let maxMinuteSnoreSeconds = timelineBuckets.values.map(\.snoreCount).max() ?? 0
+
+        if usedMachineLearning,
+           snoreSeconds >= 900
+            || ratio >= 0.08
+            || longestSnoreRunSeconds >= 60
+            || activeSnoreMinutes >= 20
+            || maxMinuteSnoreSeconds >= 40 {
             verdict = .snoring
-        } else if ratio >= 0.07 || (!usedMachineLearning && (loudRatio >= 0.14 || peakDecibels > -24)) {
+        } else if usedMachineLearning,
+                  snoreSeconds >= 120
+                    || ratio >= 0.015
+                    || longestSnoreRunSeconds >= 15
+                    || activeSnoreMinutes >= 4
+                    || snoreEventCount >= 6 {
+            verdict = .borderline
+        } else if !usedMachineLearning && (ratio >= 0.16 || loudRatio >= 0.28 || peakDecibels > -14) {
+            verdict = .snoring
+        } else if !usedMachineLearning && (ratio >= 0.07 || loudRatio >= 0.14 || peakDecibels > -24) {
             verdict = .borderline
         } else {
             verdict = .safe
@@ -337,6 +358,9 @@ final class SnoreMonitor: @unchecked Sendable {
         lastSnoreSecondsFromStart = nil
         peakDecibels = -160
         timelineBuckets = [:]
+        dbFloorSamples = []
+        noiseFloorDb = -75
+        recentCandidateFlags = []
         pendingAudioSamples = []
     }
 
@@ -353,12 +377,12 @@ final class SnoreMonitor: @unchecked Sendable {
 
             let sourceRate = pendingSampleRate
             Task.detached(priority: .utility) { [classifier] in
-                let probability = classifier.predictSnoreProbability(samples: window, sourceSampleRate: sourceRate)
+                let prediction = classifier.predictProbabilities(samples: window, sourceSampleRate: sourceRate)
                 let normalizedSamples = classifier.normalizedOneSecondSamples(samples: window, sourceSampleRate: sourceRate)
                 let metrics = Self.analyze(samples: normalizedSamples)
                 await MainActor.run {
                     self.recordClassification(
-                        probability: probability,
+                        prediction: prediction,
                         normalizedSamples: normalizedSamples,
                         metrics: metrics,
                         sourceRate: sourceRate
@@ -370,16 +394,21 @@ final class SnoreMonitor: @unchecked Sendable {
 
     @MainActor
     private func recordClassification(
-        probability: Float?,
+        prediction: SnoreAudioClassifier.Prediction?,
         normalizedSamples: [Float],
         metrics: (db: Float, zeroCrossingRate: Double)?,
         sourceRate: Double
     ) {
-        guard let probability else { return }
+        guard let prediction else { return }
 
         let windowIndex = mlWindowCount
-        let isLoudEnough = (metrics?.db ?? -160) > snoreDecibelGate
-        let isSnoring = probability >= classifier.snoreThreshold && isLoudEnough
+        let probability = prediction.snoreProbability
+        let nonSnoreProbability = prediction.nonSnoreProbability
+        let db = metrics?.db ?? -160
+        updateNoiseFloor(with: db, windowIndex: windowIndex)
+        let dbRelative = db - noiseFloorDb
+        let isCandidate = isSnoreCandidate(probability: probability, db: db, dbRelative: dbRelative)
+        let isSnoring = smoothedSnoreDecision(candidate: isCandidate)
         mlWindowCount += 1
         mlProbabilitySum += Double(probability)
         mlMaximumProbability = max(mlMaximumProbability, probability)
@@ -416,15 +445,54 @@ final class SnoreMonitor: @unchecked Sendable {
         trainingRecorder.record(
             TrainingDataRecorder.Segment(
                 probability: probability,
+                nonSnoreProbability: nonSnoreProbability,
+                snoreProbability: probability,
+                probabilitySum: nonSnoreProbability + probability,
                 isSnoring: isSnoring,
                 db: metrics.db,
+                dbRelative: dbRelative,
+                noiseFloorDb: noiseFloorDb,
                 zeroCrossingRate: metrics.zeroCrossingRate,
                 sourceSampleRate: sourceRate,
                 windowIndex: windowIndex,
                 secondsFromStart: Double(windowIndex),
+                snoreIndexUsed: 1,
+                candidateRuleVersion: candidateRuleVersion,
                 normalizedSamples: normalizedSamples
             )
         )
+    }
+
+    private func updateNoiseFloor(with db: Float, windowIndex: Int) {
+        guard db > -160 else { return }
+        dbFloorSamples.append(db)
+        if dbFloorSamples.count > 3_600 {
+            dbFloorSamples.removeFirst(dbFloorSamples.count - 3_600)
+        }
+        if windowIndex < 10 || windowIndex.isMultiple(of: 30) {
+            noiseFloorDb = percentile(dbFloorSamples, percentile: 0.20) ?? noiseFloorDb
+        }
+    }
+
+    private func isSnoreCandidate(probability: Float, db: Float, dbRelative: Float) -> Bool {
+        (probability >= 0.60 && dbRelative >= 10 && db > -68)
+            || (probability >= 0.45 && dbRelative >= 14 && db > -70)
+    }
+
+    private func smoothedSnoreDecision(candidate: Bool) -> Bool {
+        recentCandidateFlags.append(candidate)
+        if recentCandidateFlags.count > 3 {
+            recentCandidateFlags.removeFirst(recentCandidateFlags.count - 3)
+        }
+        return recentCandidateFlags.filter { $0 }.count >= 2
+    }
+
+    private func percentile(_ values: [Float], percentile: Float) -> Float? {
+        guard !values.isEmpty else { return nil }
+        let sorted = values.sorted()
+        let clamped = min(max(percentile, 0), 1)
+        let index = Int((Float(sorted.count - 1) * clamped).rounded())
+        return sorted[index]
     }
 
     private func recordTimelineBucket(

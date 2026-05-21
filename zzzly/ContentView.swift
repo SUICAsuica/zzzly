@@ -899,27 +899,42 @@ private struct RecordedAudioClip: Identifiable {
             return []
         }
 
-        return rows
-            .split(separator: "\n")
+        let lines = rows.split(separator: "\n")
+        guard let headerLine = lines.first else { return [] }
+        let header = headerLine.split(separator: ",", omittingEmptySubsequences: false).map(String.init)
+        let index = Dictionary(uniqueKeysWithValues: header.enumerated().map { ($1, $0) })
+        let audioIndex = index["audio_file"] ?? 8
+        let probabilityIndex = index["p_snore"] ?? index["probability"] ?? 3
+        let snoreIndex = index["is_snore"] ?? 4
+        let dbIndex = index["db"] ?? 5
+        let secondsIndex = index["seconds_from_start"] ?? 2
+        let windowIndex = index["window_index"] ?? 1
+
+        return lines
             .dropFirst()
             .compactMap { line -> RecordedAudioClip? in
                 let columns = line.split(separator: ",", omittingEmptySubsequences: false).map(String.init)
-                guard columns.count >= 9,
-                      !columns[8].isEmpty,
-                      let seconds = Double(columns[2]),
-                      let probability = Double(columns[3]),
-                      let isSnoreInt = Int(columns[4]),
-                      let db = Double(columns[5]) else {
+                guard columns.indices.contains(audioIndex),
+                      columns.indices.contains(probabilityIndex),
+                      columns.indices.contains(snoreIndex),
+                      columns.indices.contains(dbIndex),
+                      columns.indices.contains(secondsIndex),
+                      columns.indices.contains(windowIndex),
+                      !columns[audioIndex].isEmpty,
+                      let seconds = Double(columns[secondsIndex]),
+                      let probability = Double(columns[probabilityIndex]),
+                      let isSnoreInt = Int(columns[snoreIndex]),
+                      let db = Double(columns[dbIndex]) else {
                     return nil
                 }
 
-                let url = sessionDirectory.appendingPathComponent(columns[8])
+                let url = sessionDirectory.appendingPathComponent(columns[audioIndex])
                 guard FileManager.default.fileExists(atPath: url.path) else {
                     return nil
                 }
 
                 return RecordedAudioClip(
-                    id: columns[1],
+                    id: columns[windowIndex],
                     url: url,
                     secondsFromStart: seconds,
                     probability: probability,
